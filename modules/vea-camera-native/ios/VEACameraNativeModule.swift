@@ -10,8 +10,6 @@ public class VEACameraNativeModule: Module {
     }
 
     View(VEADualCameraView.self) {
-      Name("VEADualCameraView")
-
       Events("onReady", "onError")
 
       Prop("pipDiameter") { (view: VEADualCameraView, value: Double) in
