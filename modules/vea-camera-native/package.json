@@ -1,0 +1,8 @@
+{
+  "name": "vea-camera-native",
+  "version": "0.1.0",
+  "description": "Native iOS MultiCam preview module for VEA Camera",
+  "main": "src/VEACameraNativeModule.js",
+  "license": "MIT",
+  "author": "VEA"
+}

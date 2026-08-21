@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "VEA Camera",
+    "slug": "vea-camera",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "org.vea.camera",
+      "infoPlist": {
+        "NSCameraUsageDescription": "VEA Camera necesita acceso a las cámaras para crear la composición de video.",
+        "NSMicrophoneUsageDescription": "VEA Camera necesita acceso al micrófono para grabar el audio y generar subtítulos."
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permite que VEA Camera use las cámaras para grabar video.",
+          "microphonePermission": "Permite que VEA Camera use el micrófono para grabar audio.",
+          "recordAudioAndroid": true
+        }
+      ]
+    ]
+  }
+}
