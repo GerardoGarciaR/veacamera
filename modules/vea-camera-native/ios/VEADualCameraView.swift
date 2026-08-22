@@ -5,7 +5,7 @@ import ExpoModulesCore
 import Photos
 import UIKit
 
-final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
   let onReady = EventDispatcher()
   let onError = EventDispatcher()
   let onRecordingStarted = EventDispatcher()
@@ -94,7 +94,6 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
   private let backVideoOutput = AVCaptureVideoDataOutput()
   private let frontVideoOutput = AVCaptureVideoDataOutput()
   private var audioOutput: AVCaptureAudioDataOutput?
-  private var outputSynchronizer: AVCaptureDataOutputSynchronizer?
 
   private var configured = false
   private var configuring = false
@@ -146,6 +145,15 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
   private var recordingPipDiameterRatio: CGFloat = 0.31
   private var recordingPipMarginRatio: CGFloat = 0.04
   private var recordingPipTopRatio: CGFloat = 0.065
+
+  // Keep the latest front-camera sample, following Apple's AVMultiCamPiP pattern.
+  // The back-camera frame drives the movie timeline and is composited with this
+  // most recent front-camera frame. This avoids losing the PiP when one side of
+  // AVCaptureDataOutputSynchronizer reports a dropped sample.
+  private var latestFrontSampleBuffer: CMSampleBuffer?
+  private var didLogFirstFrontFrame = false
+  private var didLogWaitingForFrontFrame = false
+  private var didLogFirstCompositedFrame = false
 
   // MARK: - Init
 
@@ -264,7 +272,8 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
   }
 
   deinit {
-    outputSynchronizer?.setDelegate(nil, queue: nil)
+    backVideoOutput.setSampleBufferDelegate(nil, queue: nil)
+    frontVideoOutput.setSampleBufferDelegate(nil, queue: nil)
     audioOutput?.setSampleBufferDelegate(nil, queue: nil)
 
     if session.isRunning {
@@ -621,9 +630,11 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
       configurePortraitOrientation(for: frontDataConnection)
       configureFrontMirroring(for: frontDataConnection)
 
-      let synchronizer = AVCaptureDataOutputSynchronizer(dataOutputs: [backVideoOutput, frontVideoOutput])
-      synchronizer.setDelegate(self, queue: recordingQueue)
-      outputSynchronizer = synchronizer
+      // Receive each camera independently on one serial queue.
+      // Apple's AVMultiCamPiP sample uses the same approach: cache the current PiP
+      // frame and composite it whenever a new full-screen frame arrives.
+      backVideoOutput.setSampleBufferDelegate(self, queue: recordingQueue)
+      frontVideoOutput.setSampleBufferDelegate(self, queue: recordingQueue)
 
       // Microphone. App.jsx asks for permission before mounting this view.
       if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
@@ -710,6 +721,10 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
     recordingPipDiameterRatio = snapshot.pipDiameterRatio
     recordingPipMarginRatio = snapshot.pipMarginRatio
     recordingPipTopRatio = snapshot.pipTopRatio
+    didLogWaitingForFrontFrame = false
+    didLogFirstCompositedFrame = false
+
+    print("[VEACameraNative] ⏺️ Grabación solicitada · PiP frontal: \(recordingFrontCameraVisible ? "ON" : "OFF")")
 
     do {
       let url = temporaryRecordingURL()
@@ -838,29 +853,51 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
     }
   }
 
-  // MARK: - Synchronized video frames
+  // MARK: - Camera / microphone sample buffers
 
-  func dataOutputSynchronizer(
-    _ synchronizer: AVCaptureDataOutputSynchronizer,
-    didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection
+  func captureOutput(
+    _ output: AVCaptureOutput,
+    didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
   ) {
+    // PiP source: cache the latest front-camera frame even before REC starts.
+    // That way the first encoded back-camera frame can already contain the PiP.
+    if output === frontVideoOutput {
+      guard CMSampleBufferGetImageBuffer(sampleBuffer) != nil else { return }
+      latestFrontSampleBuffer = sampleBuffer
+
+      if !didLogFirstFrontFrame {
+        didLogFirstFrontFrame = true
+        let dimensions = CMVideoFormatDescriptionGetDimensions(
+          CMSampleBufferGetFormatDescription(sampleBuffer)!
+        )
+        print("[VEACameraNative] 🎥 Primer frame frontal recibido: \(dimensions.width)x\(dimensions.height)")
+      }
+      return
+    }
+
+    // The back camera drives the encoded movie timeline.
+    if output === backVideoOutput {
+      processBackVideoSampleBuffer(sampleBuffer)
+      return
+    }
+
+    // Audio is appended to the same AVAssetWriter session.
+    if let audioOutput, output === audioOutput {
+      processAudioSampleBuffer(sampleBuffer)
+    }
+  }
+
+  private func processBackVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
     guard isRecordingNative,
           let writer = assetWriter,
           let videoInput = videoWriterInput,
-          let adaptor = pixelBufferAdaptor else {
+          let adaptor = pixelBufferAdaptor,
+          let backPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
       return
     }
 
-    guard let backData = synchronizedDataCollection.synchronizedData(for: backVideoOutput)
-      as? AVCaptureSynchronizedSampleBufferData,
-      !backData.sampleBufferWasDropped else {
-      return
-    }
-
-    let backSampleBuffer = backData.sampleBuffer
-    guard let backPixelBuffer = CMSampleBufferGetImageBuffer(backSampleBuffer) else { return }
-
-    let presentationTime = CMSampleBufferGetPresentationTimeStamp(backSampleBuffer)
+    let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
     if writerSessionStartTime == nil {
       guard writer.startWriting() else {
@@ -877,11 +914,22 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
     guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
 
     var frontPixelBuffer: CVPixelBuffer?
-    if recordingFrontCameraVisible,
-       let frontData = synchronizedDataCollection.synchronizedData(for: frontVideoOutput)
-        as? AVCaptureSynchronizedSampleBufferData,
-       !frontData.sampleBufferWasDropped {
-      frontPixelBuffer = CMSampleBufferGetImageBuffer(frontData.sampleBuffer)
+
+    if recordingFrontCameraVisible {
+      // Important: when PiP is enabled, do NOT silently encode a back-only frame.
+      // Wait until we have at least one real front-camera frame.
+      guard
+        let frontSampleBuffer = latestFrontSampleBuffer,
+        let cachedFrontPixelBuffer = CMSampleBufferGetImageBuffer(frontSampleBuffer)
+      else {
+        if !didLogWaitingForFrontFrame {
+          didLogWaitingForFrontFrame = true
+          print("[VEACameraNative] ⏳ Esperando primer frame frontal antes de codificar PiP…")
+        }
+        return
+      }
+
+      frontPixelBuffer = cachedFrontPixelBuffer
     }
 
     guard let pool = adaptor.pixelBufferPool else { return }
@@ -891,25 +939,30 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
 
     autoreleasepool {
       let composition = composeFrame(back: backPixelBuffer, front: frontPixelBuffer)
+
       ciContext.render(
         composition,
         to: outputPixelBuffer,
         bounds: CGRect(origin: .zero, size: outputSize),
         colorSpace: outputColorSpace
       )
-      _ = adaptor.append(outputPixelBuffer, withPresentationTime: presentationTime)
+
+      let appended = adaptor.append(outputPixelBuffer, withPresentationTime: presentationTime)
+
+      if appended, !didLogFirstCompositedFrame {
+        didLogFirstCompositedFrame = true
+        print(
+          "[VEACameraNative] ✅ Primer frame MP4 compuesto · PiP frontal: \(recordingFrontCameraVisible && frontPixelBuffer != nil ? "SÍ" : "NO")"
+        )
+      } else if !appended, writer.status == .failed {
+        let message = writer.error?.localizedDescription ?? "No pude añadir el frame compuesto al MP4."
+        emitRecordingError(message)
+      }
     }
   }
 
-  // MARK: - Audio samples
-
-  func captureOutput(
-    _ output: AVCaptureOutput,
-    didOutput sampleBuffer: CMSampleBuffer,
-    from connection: AVCaptureConnection
-  ) {
-    guard output === audioOutput,
-          isRecordingNative,
+  private func processAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    guard isRecordingNative,
           let writer = assetWriter,
           writer.status == .writing,
           let audioInput = audioWriterInput,
@@ -945,15 +998,17 @@ final class VEADualCameraView: ExpoView, AVCaptureDataOutputSynchronizerDelegate
       )
 
       let frontImage = aspectFill(CIImage(cvPixelBuffer: front), to: pipRect)
+        .cropped(to: pipRect)
+
       let transparentCanvas = CIImage(color: CIColor.clear).cropped(to: outputRect)
-      let frontCanvas = frontImage.composited(over: transparentCanvas)
+      let frontCanvas = frontImage.composited(over: transparentCanvas).cropped(to: outputRect)
 
       if let radial = CIFilter(name: "CIRadialGradient", parameters: [
         "inputCenter": CIVector(x: pipRect.midX, y: pipRect.midY),
-        "inputRadius0": max(0, diameter / 2 - 1.5),
+        "inputRadius0": max(0, diameter / 2 - 2.0),
         "inputRadius1": diameter / 2,
-        "inputColor0": CIColor.white,
-        "inputColor1": CIColor.black
+        "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 1),
+        "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 1)
       ])?.outputImage?.cropped(to: outputRect),
          let blend = CIFilter(name: "CIBlendWithMask", parameters: [
           kCIInputImageKey: frontCanvas,
