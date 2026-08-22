@@ -19,4 +19,7 @@ Pod::Spec.new do |s|
   }
 
   s.source_files = '**/*.{h,m,mm,swift,hpp,cpp}'
+  # Copy the VEA watermark directly into the app resources.
+  # This avoids bundle-resolution differences with local/static CocoaPods modules.
+  s.resources = ['Resources/vea-logo.png']
 end

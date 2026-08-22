@@ -20,12 +20,24 @@ public class VEACameraNativeModule: Module {
         view.pipMargin = CGFloat(max(8, min(value, 48)))
       }
 
-      Prop("logoText") { (view: VEADualCameraView, value: String) in
-        view.logoText = value
-      }
-
       Prop("logoVisible") { (view: VEADualCameraView, value: Bool) in
         view.logoVisible = value
+      }
+
+      Prop("logoWidthRatio") { (view: VEADualCameraView, value: Double) in
+        view.logoWidthRatio = CGFloat(max(0.18, min(value, 0.45)))
+      }
+
+      Prop("tiktokSafeRightRatio") { (view: VEADualCameraView, value: Double) in
+        view.tiktokSafeRightRatio = CGFloat(max(0.08, min(value, 0.32)))
+      }
+
+      Prop("tiktokSafeBottomRatio") { (view: VEADualCameraView, value: Double) in
+        view.tiktokSafeBottomRatio = CGFloat(max(0.08, min(value, 0.32)))
+      }
+
+      Prop("showTikTokSafeZone") { (view: VEADualCameraView, value: Bool) in
+        view.showTikTokSafeZone = value
       }
     }
   }

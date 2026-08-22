@@ -114,8 +114,11 @@ export default function App() {
         style={StyleSheet.absoluteFill}
         pipDiameter={132}
         pipMargin={18}
-        logoText="VEA"
         logoVisible
+        logoWidthRatio={0.34}
+        tiktokSafeRightRatio={0.16}
+        tiktokSafeBottomRatio={0.18}
+        showTikTokSafeZone={false}
         onReady={(event) => {
           const hardwareCost = event?.nativeEvent?.hardwareCost;
           setNativeStatus(
