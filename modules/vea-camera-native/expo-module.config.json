@@ -1,7 +1,6 @@
 {
   "platforms": ["apple"],
   "apple": {
-    "modules": ["VEACameraNativeModule"],
-    "podspecPath": "ios/VEACameraNative.podspec"
+    "modules": ["VEACameraNativeModule"]
   }
 }

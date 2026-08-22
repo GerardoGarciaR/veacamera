@@ -1,10 +1,9 @@
-import { Platform } from 'react-native';
-import { requireOptionalNativeModule } from 'expo';
+import { requireNativeModule } from 'expo-modules-core';
 
-const nativeModule = Platform.OS === 'ios'
-  ? requireOptionalNativeModule('VEACameraNative')
-  : null;
+const VEACameraNative = requireNativeModule('VEACameraNative');
 
 export function isMultiCamSupported() {
-  return nativeModule?.isMultiCamSupported?.() ?? false;
+    return VEACameraNative.isMultiCamSupported();
 }
+
+export default VEACameraNative;

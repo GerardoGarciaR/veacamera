@@ -10,7 +10,13 @@ public class VEACameraNativeModule: Module {
     }
 
     View(VEADualCameraView.self) {
-      Events("onReady", "onError")
+      Events(
+        "onReady",
+        "onError",
+        "onRecordingStarted",
+        "onRecordingFinished",
+        "onRecordingError"
+      )
 
       Prop("pipDiameter") { (view: VEADualCameraView, value: Double) in
         view.pipDiameter = CGFloat(max(72, min(value, 220)))
@@ -25,7 +31,7 @@ public class VEACameraNativeModule: Module {
       }
 
       Prop("logoWidthRatio") { (view: VEADualCameraView, value: Double) in
-        view.logoWidthRatio = CGFloat(max(0.18, min(value, 0.45)))
+        view.logoWidthRatio = CGFloat(max(0.16, min(value, 0.32)))
       }
 
       Prop("tiktokSafeRightRatio") { (view: VEADualCameraView, value: Double) in
@@ -38,6 +44,22 @@ public class VEACameraNativeModule: Module {
 
       Prop("showTikTokSafeZone") { (view: VEADualCameraView, value: Bool) in
         view.showTikTokSafeZone = value
+      }
+
+      Prop("frontCameraVisible") { (view: VEADualCameraView, value: Bool) in
+        view.frontCameraVisible = value
+      }
+
+      Prop("sermonTitle") { (view: VEADualCameraView, value: String) in
+        view.sermonTitle = value
+      }
+
+      Prop("coverImageUri") { (view: VEADualCameraView, value: String) in
+        view.coverImageUri = value
+      }
+
+      Prop("recording") { (view: VEADualCameraView, value: Bool) in
+        view.recording = value
       }
     }
   }
