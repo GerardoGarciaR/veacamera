@@ -3,6 +3,7 @@ import CoreImage
 import CoreMedia
 import ExpoModulesCore
 import Photos
+import Speech
 import UIKit
 
 final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -119,6 +120,21 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
   private let pastorLayer = CATextLayer()
   private let bottomWebsiteLayer = CATextLayer()
 
+  // Live subtitles generated with Apple's Speech framework. The same text is
+  // shown in the preview and composited into the recorded MP4.
+  private let subtitleBackgroundLayer = CAShapeLayer()
+  private let subtitleLayer = CATextLayer()
+
+  private let speechLocale = Locale(identifier: "es-MX")
+  private var speechRecognizer: SFSpeechRecognizer?
+  private var speechRecognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var speechRecognitionTask: SFSpeechRecognitionTask?
+  private var speechAuthorizationGranted = false
+  private var speechRecognitionWanted = true
+  private var currentSubtitleText = ""
+  private var recordingSubtitleCIImage: CIImage?
+  private var subtitleClearWorkItem: DispatchWorkItem?
+
   private let safeZoneOverlay: UIView = {
     let view = UIView()
     view.backgroundColor = .clear
@@ -203,6 +219,22 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
       $0.alignmentMode = .left
     }
 
+    subtitleBackgroundLayer.fillColor = UIColor.black.withAlphaComponent(0.62).cgColor
+    subtitleBackgroundLayer.strokeColor = UIColor.white.withAlphaComponent(0.16).cgColor
+    subtitleBackgroundLayer.lineWidth = 1
+    subtitleBackgroundLayer.isHidden = true
+
+    subtitleLayer.contentsScale = UIScreen.main.scale
+    subtitleLayer.foregroundColor = UIColor.white.cgColor
+    subtitleLayer.alignmentMode = .center
+    subtitleLayer.isWrapped = true
+    subtitleLayer.truncationMode = .none
+    subtitleLayer.shadowColor = UIColor.black.cgColor
+    subtitleLayer.shadowOpacity = 0.82
+    subtitleLayer.shadowRadius = 2.5
+    subtitleLayer.shadowOffset = CGSize(width: 0, height: 1)
+    subtitleLayer.isHidden = true
+
     addSubview(safeZoneOverlay)
 
     [
@@ -213,11 +245,15 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
       titleLayer,
       churchLayer,
       pastorLayer,
-      bottomWebsiteLayer
+      bottomWebsiteLayer,
+      subtitleBackgroundLayer,
+      subtitleLayer
     ].forEach {
       $0.zPosition = 10_000
       layer.addSublayer($0)
     }
+
+    requestSpeechAuthorizationIfNeeded()
   }
 
   // MARK: - Back camera pinch-to-zoom
@@ -312,6 +348,7 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
       in: CGSize(width: width, height: height),
       safeTop: safeAreaInsets.top
     )
+    layoutSubtitleLayers(in: CGSize(width: width, height: height))
 
     safeZoneOverlay.layer.zPosition = 9_000
     bringSubviewToFront(safeZoneOverlay)
@@ -323,9 +360,279 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
     backVideoOutput.setSampleBufferDelegate(nil, queue: nil)
     frontVideoOutput.setSampleBufferDelegate(nil, queue: nil)
     audioOutput?.setSampleBufferDelegate(nil, queue: nil)
+    speechRecognitionRequest?.endAudio()
+    speechRecognitionTask?.cancel()
+    subtitleClearWorkItem?.cancel()
 
     if session.isRunning {
       session.stopRunning()
+    }
+  }
+
+  // MARK: - Live subtitles / Speech recognition
+
+  private func requestSpeechAuthorizationIfNeeded() {
+    switch SFSpeechRecognizer.authorizationStatus() {
+    case .authorized:
+      speechAuthorizationGranted = true
+      recordingQueue.async { [weak self] in
+        self?.startSpeechRecognitionLockedIfPossible()
+      }
+
+    case .notDetermined:
+      SFSpeechRecognizer.requestAuthorization { [weak self] status in
+        guard let self else { return }
+        self.recordingQueue.async {
+          self.speechAuthorizationGranted = (status == .authorized)
+          if self.speechAuthorizationGranted {
+            self.startSpeechRecognitionLockedIfPossible()
+          } else {
+            print("[VEACameraNative] ℹ️ Reconocimiento de voz no autorizado; la cámara continuará sin subtítulos.")
+          }
+        }
+      }
+
+    case .denied, .restricted:
+      speechAuthorizationGranted = false
+      print("[VEACameraNative] ℹ️ Reconocimiento de voz desactivado por permisos de iOS.")
+
+    @unknown default:
+      speechAuthorizationGranted = false
+    }
+  }
+
+  private func startSpeechRecognitionLockedIfPossible() {
+    guard speechRecognitionWanted,
+          speechAuthorizationGranted,
+          audioOutput != nil,
+          speechRecognitionRequest == nil,
+          speechRecognitionTask == nil else {
+      return
+    }
+
+    guard let recognizer = SFSpeechRecognizer(locale: speechLocale), recognizer.isAvailable else {
+      print("[VEACameraNative] ℹ️ Speech no está disponible temporalmente para es-MX.")
+      return
+    }
+
+    speechRecognizer = recognizer
+
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.shouldReportPartialResults = true
+    request.taskHint = .dictation
+
+    if #available(iOS 16.0, *) {
+      request.addsPunctuation = true
+    }
+
+    // Prefer local recognition when the device/language supports it so a weak
+    // church Wi-Fi connection does not interrupt the captions.
+    if recognizer.supportsOnDeviceRecognition {
+      request.requiresOnDeviceRecognition = true
+    }
+
+    speechRecognitionRequest = request
+
+    speechRecognitionTask = recognizer.recognitionTask(with: request) { [weak self, weak request] result, error in
+      guard let self, let request else { return }
+
+      self.recordingQueue.async {
+        // Ignore callbacks from a task that has already been replaced.
+        guard self.speechRecognitionRequest === request else { return }
+
+        if let result {
+          let text = self.subtitleWindow(from: result.bestTranscription.formattedString)
+          self.publishSubtitleLocked(text, final: result.isFinal)
+        }
+
+        if result?.isFinal == true || error != nil {
+          self.finishSpeechRecognitionLocked(restart: true)
+        }
+      }
+    }
+
+    print("[VEACameraNative] 💬 Subtítulos en vivo activos · idioma es-MX · on-device: \(recognizer.supportsOnDeviceRecognition ? "SÍ" : "NO")")
+  }
+
+  private func finishSpeechRecognitionLocked(restart: Bool) {
+    let oldRequest = speechRecognitionRequest
+    let oldTask = speechRecognitionTask
+
+    speechRecognitionRequest = nil
+    speechRecognitionTask = nil
+
+    oldRequest?.endAudio()
+    oldTask?.cancel()
+
+    guard restart, speechRecognitionWanted, speechAuthorizationGranted else { return }
+
+    recordingQueue.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+      self?.startSpeechRecognitionLockedIfPossible()
+    }
+  }
+
+  private func subtitleWindow(from transcription: String) -> String {
+    let normalized = transcription
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !normalized.isEmpty else { return "" }
+
+    // Keep the subtitle readable instead of placing the full sermon transcript
+    // on screen. About 14 words typically fit in two vertical-video lines.
+    let words = normalized.split(separator: " ")
+    return words.suffix(14).joined(separator: " ")
+  }
+
+  private func publishSubtitleLocked(_ text: String, final: Bool) {
+    guard text != currentSubtitleText || final else { return }
+
+    currentSubtitleText = text
+    subtitleClearWorkItem?.cancel()
+
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.updateSubtitlePreview(text)
+
+      let image = self.renderRecordingSubtitleImage(text: text, size: self.outputSize)
+      let ciImage = image.flatMap(CIImage.init(image:))?.cropped(
+        to: CGRect(origin: .zero, size: self.outputSize)
+      )
+
+      self.recordingQueue.async { [weak self] in
+        self?.recordingSubtitleCIImage = ciImage
+      }
+    }
+
+    if final {
+      let finalText = text
+      let workItem = DispatchWorkItem { [weak self] in
+        guard let self, self.currentSubtitleText == finalText else { return }
+        self.currentSubtitleText = ""
+
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.updateSubtitlePreview("")
+          self.recordingQueue.async { [weak self] in
+            self?.recordingSubtitleCIImage = nil
+          }
+        }
+      }
+
+      subtitleClearWorkItem = workItem
+      recordingQueue.asyncAfter(deadline: .now() + 2.4, execute: workItem)
+    }
+  }
+
+  private func updateSubtitlePreview(_ text: String) {
+    let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hidden = clean.isEmpty
+
+    subtitleLayer.isHidden = hidden
+    subtitleBackgroundLayer.isHidden = hidden
+
+    guard !hidden else {
+      subtitleLayer.string = nil
+      setNeedsLayout()
+      return
+    }
+
+    let fontSize = max(17, bounds.width * 0.047)
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    paragraph.lineBreakMode = .byWordWrapping
+    paragraph.minimumLineHeight = fontSize * 1.15
+    paragraph.maximumLineHeight = fontSize * 1.15
+
+    subtitleLayer.string = NSAttributedString(
+      string: clean,
+      attributes: [
+        .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+        .foregroundColor: UIColor.white,
+        .paragraphStyle: paragraph
+      ]
+    )
+
+    setNeedsLayout()
+  }
+
+  private func layoutSubtitleLayers(in size: CGSize) {
+    let w = size.width
+    let h = size.height
+    guard w > 0, h > 0 else { return }
+
+    // Above the existing lower-third branding, centered in the social safe area.
+    let boxWidth = w * 0.88
+    let boxHeight = max(58, h * 0.090)
+    let boxX = (w - boxWidth) / 2
+    let boxY = h * 0.605
+    let boxRect = CGRect(x: boxX, y: boxY, width: boxWidth, height: boxHeight)
+
+    subtitleBackgroundLayer.frame = bounds
+    subtitleBackgroundLayer.path = UIBezierPath(
+      roundedRect: boxRect,
+      cornerRadius: max(10, w * 0.028)
+    ).cgPath
+
+    let horizontalPadding = max(12, w * 0.035)
+    let verticalPadding = max(7, h * 0.008)
+    subtitleLayer.frame = boxRect.insetBy(dx: horizontalPadding, dy: verticalPadding)
+    subtitleBackgroundLayer.zPosition = 11_000
+    subtitleLayer.zPosition = 11_001
+  }
+
+  private func renderRecordingSubtitleImage(text: String, size: CGSize) -> UIImage? {
+    let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !clean.isEmpty else { return nil }
+
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = false
+
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
+    return renderer.image { context in
+      let cg = context.cgContext
+      let w = size.width
+      let h = size.height
+
+      let boxWidth = w * 0.88
+      let boxHeight = h * 0.090
+      let boxX = (w - boxWidth) / 2
+      let boxY = h * 0.605
+      let boxRect = CGRect(x: boxX, y: boxY, width: boxWidth, height: boxHeight)
+
+      let backgroundPath = UIBezierPath(roundedRect: boxRect, cornerRadius: w * 0.028)
+      cg.setFillColor(UIColor.black.withAlphaComponent(0.62).cgColor)
+      cg.addPath(backgroundPath.cgPath)
+      cg.fillPath()
+
+      cg.setStrokeColor(UIColor.white.withAlphaComponent(0.16).cgColor)
+      cg.setLineWidth(max(1, w * 0.0015))
+      cg.addPath(backgroundPath.cgPath)
+      cg.strokePath()
+
+      let fontSize = w * 0.047
+      let paragraph = NSMutableParagraphStyle()
+      paragraph.alignment = .center
+      paragraph.lineBreakMode = .byWordWrapping
+      paragraph.minimumLineHeight = fontSize * 1.15
+      paragraph.maximumLineHeight = fontSize * 1.15
+
+      let textRect = boxRect.insetBy(dx: w * 0.035, dy: h * 0.009)
+      let attributes: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+        .foregroundColor: UIColor.white,
+        .paragraphStyle: paragraph
+      ]
+
+      cg.saveGState()
+      cg.setShadow(
+        offset: CGSize(width: 0, height: 2),
+        blur: 4,
+        color: UIColor.black.withAlphaComponent(0.85).cgColor
+      )
+      (clean as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attributes, context: nil)
+      cg.restoreGState()
     }
   }
 
@@ -534,6 +841,10 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
 
       self.session.startRunning()
 
+      self.recordingQueue.async { [weak self] in
+        self?.startSpeechRecognitionLockedIfPossible()
+      }
+
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.onReady([
@@ -547,6 +858,16 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
 
   private func stopSession() {
     requestStopRecording()
+
+    recordingQueue.async { [weak self] in
+      guard let self else { return }
+      self.finishSpeechRecognitionLocked(restart: false)
+      self.currentSubtitleText = ""
+      self.recordingSubtitleCIImage = nil
+      DispatchQueue.main.async { [weak self] in
+        self?.updateSubtitlePreview("")
+      }
+    }
 
     sessionQueue.async { [weak self] in
       guard let self, self.session.isRunning else { return }
@@ -629,6 +950,8 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
         [self.logoLayer, self.topWebsiteLayer, self.coverLayer, self.watchingLayer, self.titleLayer, self.churchLayer, self.pastorLayer, self.bottomWebsiteLayer].forEach {
           $0.zPosition = 10_000
         }
+        self.subtitleBackgroundLayer.zPosition = 11_000
+        self.subtitleLayer.zPosition = 11_001
 
         self.bringSubviewToFront(self.safeZoneOverlay)
         self.setNeedsLayout()
@@ -934,8 +1257,17 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
       return
     }
 
-    // Audio is appended to the same AVAssetWriter session.
+    // Feed exactly the same microphone sample to Speech and to the MP4 writer.
+    // SFSpeechAudioBufferRecognitionRequest accepts CMSampleBuffer directly, so
+    // there is no second microphone capture session competing with MultiCam.
     if let audioOutput, output === audioOutput {
+      if speechRecognitionWanted, speechAuthorizationGranted {
+        if speechRecognitionRequest == nil {
+          startSpeechRecognitionLockedIfPossible()
+        }
+        speechRecognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+      }
+
       processAudioSampleBuffer(sampleBuffer)
     }
   }
@@ -1073,6 +1405,12 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
 
     if let overlay = recordingOverlayCIImage {
       result = overlay.composited(over: result).cropped(to: outputRect)
+    }
+
+    // Unlike the branding snapshot, captions change continuously while REC is
+    // running, so this CIImage is replaced whenever Speech produces new text.
+    if let subtitleOverlay = recordingSubtitleCIImage {
+      result = subtitleOverlay.composited(over: result).cropped(to: outputRect)
     }
 
     return result

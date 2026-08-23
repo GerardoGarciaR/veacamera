@@ -12,7 +12,8 @@
       "bundleIdentifier": "org.vea.camera",
       "infoPlist": {
         "NSCameraUsageDescription": "VEA Camera necesita acceso a las cámaras para crear la composición de video.",
-        "NSMicrophoneUsageDescription": "VEA Camera necesita acceso al micrófono para grabar el audio y generar subtítulos."
+        "NSMicrophoneUsageDescription": "VEA Camera necesita acceso al micrófono para grabar el audio y generar subtítulos.",
+        "NSSpeechRecognitionUsageDescription": "VEA Camera usa reconocimiento de voz para generar subtítulos en vivo durante las predicaciones."
       }
     },
     "web": {
