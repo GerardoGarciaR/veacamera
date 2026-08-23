@@ -5,7 +5,9 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
     "ios": {
+      "icon": "./assets/icon.png",
       "supportsTablet": false,
       "bundleIdentifier": "org.vea.camera",
       "infoPlist": {

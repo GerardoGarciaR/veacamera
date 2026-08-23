@@ -91,6 +91,13 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
   private var backPreviewLayer: AVCaptureVideoPreviewLayer?
   private var frontPreviewLayer: AVCaptureVideoPreviewLayer?
 
+  // Back-camera zoom. The AVCaptureDevice zoom is applied before both the
+  // preview layer and AVCaptureVideoDataOutput, so the recorded MP4 follows
+  // exactly the same zoom the operator sees on screen.
+  private weak var backCameraDevice: AVCaptureDevice?
+  private var pinchStartZoomFactor: CGFloat = 1.0
+  private let maximumUserZoomFactor: CGFloat = 5.0
+
   private let backVideoOutput = AVCaptureVideoDataOutput()
   private let frontVideoOutput = AVCaptureVideoDataOutput()
   private var audioOutput: AVCaptureAudioDataOutput?
@@ -162,6 +169,12 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
 
     backgroundColor = .black
     clipsToBounds = true
+    isUserInteractionEnabled = true
+
+    let pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinchToZoom(_:)))
+    // Do not cancel React Native / HUD touches if a gesture begins near an overlay.
+    pinchGesture.cancelsTouchesInView = false
+    addGestureRecognizer(pinchGesture)
 
     logoImage = Self.loadLogoImage()
     logoLayer.contents = logoImage?.cgImage
@@ -204,6 +217,41 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
     ].forEach {
       $0.zPosition = 10_000
       layer.addSublayer($0)
+    }
+  }
+
+  // MARK: - Back camera pinch-to-zoom
+
+  @objc
+  private func handlePinchToZoom(_ gesture: UIPinchGestureRecognizer) {
+    guard let device = backCameraDevice else { return }
+
+    switch gesture.state {
+    case .began:
+      // Remember the zoom at the moment this particular pinch starts.
+      // This makes consecutive pinch gestures accumulate naturally.
+      pinchStartZoomFactor = device.videoZoomFactor
+
+    case .changed:
+      let hardwareMaxZoom = max(1.0, device.activeFormat.videoMaxZoomFactor)
+      let allowedMaxZoom = min(maximumUserZoomFactor, hardwareMaxZoom)
+      let requestedZoom = pinchStartZoomFactor * gesture.scale
+      let clampedZoom = min(max(requestedZoom, 1.0), allowedMaxZoom)
+
+      do {
+        try device.lockForConfiguration()
+        device.videoZoomFactor = clampedZoom
+        device.unlockForConfiguration()
+      } catch {
+        print("[VEACameraNative] ⚠️ No pude aplicar zoom: \(error.localizedDescription)")
+      }
+
+    case .ended, .cancelled, .failed:
+      // Preserve the final value as the starting point for the next pinch.
+      pinchStartZoomFactor = device.videoZoomFactor
+
+    default:
+      break
     }
   }
 
@@ -518,6 +566,10 @@ final class VEADualCameraView: ExpoView, AVCaptureVideoDataOutputSampleBufferDel
         emitError("No pude localizar simultáneamente la cámara frontal y la trasera.")
         return false
       }
+
+      // Keep the physical back-camera device so pinch gestures can adjust its zoom.
+      backCameraDevice = backDevice
+      pinchStartZoomFactor = backDevice.videoZoomFactor
 
       let backInput = try AVCaptureDeviceInput(device: backDevice)
       let frontInput = try AVCaptureDeviceInput(device: frontDevice)
